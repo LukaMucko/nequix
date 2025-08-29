@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jraph
 
 from nequix.layer_norm import RMSLayerNorm
+from data import basis_irreps_e3nn
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
@@ -214,14 +215,16 @@ class Nequix(eqx.Module):
     shift: float = eqx.field(static=True)
     scale: float = eqx.field(static=True)
 
-    atom_energies: jax.Array
     layers: list[NequixConvolution]
-    readout: e3nn.equinox.Linear
+    readout_pvec: e3nn.equinox.Linear
+    species_orbital_irreps: list[e3nn.Irreps] = eqx.field(static=True)
+    species_orbital_dims: jax.Array
+    max_p_len: int = eqx.field(static=True)
 
     def __init__(
         self,
         key,
-        n_species,
+        n_species: int = 5,  # qm7 H,C,O,N,S
         lmax: int = 3,
         cutoff: float = 5.0,
         hidden_irreps: str = "128x0e + 128x1o + 128x2e + 128x3o",
@@ -232,30 +235,29 @@ class Nequix(eqx.Module):
         radial_polynomial_p: float = 2.0,
         mlp_init_scale: float = 4.0,
         index_weights: bool = True,
-        shift: float = 0.0,
-        scale: float = 1.0,
         avg_n_neighbors: float = 1.0,
-        atom_energies: Optional[Sequence[float]] = None,
         layer_norm: bool = False,
+        basis: str = "sto-3g",
     ):
         self.lmax = lmax
         self.cutoff = cutoff
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
-        self.shift = shift
-        self.scale = scale
-        self.atom_energies = (
-            jnp.array(atom_energies)
-            if atom_energies is not None
-            else jnp.zeros(n_species, dtype=jnp.float32)
+        species_orbital_irreps = basis_irreps_e3nn(basis)
+        self.species_orbital_irreps = [e3nn.Irreps(s) for s in species_orbital_irreps]
+        self.species_orbital_dims = jnp.array(
+            [irr.dim for irr in self.species_orbital_irreps], dtype=jnp.int32
         )
+
+        self.max_p_len = (self.max_orbitals * (self.max_orbitals + 1)) // 2
         input_irreps = e3nn.Irreps(f"{n_species}x0e")
         sh_irreps = e3nn.s2_irreps(lmax)
         hidden_irreps = e3nn.Irreps(hidden_irreps)
         self.layers = []
 
-        key, *subkeys = jax.random.split(key, n_layers + 1)
+        keys = jax.random.split(key, n_layers + 2)
+        subkeys = keys[:n_layers]
         for i in range(n_layers):
             self.layers.append(
                 NequixConvolution(
@@ -274,26 +276,26 @@ class Nequix(eqx.Module):
                 )
             )
 
-        self.readout = e3nn.equinox.Linear(
-            irreps_in=hidden_irreps.filter("0e"), irreps_out="0e", key=key
+        self.readout_pvec = e3nn.equinox.Linear(
+            irreps_in=hidden_irreps.filter("0e"),
+            irreps_out=f"{self.max_p_len}x0e",
+            key=keys[n_layers + 1],
         )
 
-    def node_energies(
-        self,
-        displacements: jax.Array,
-        species: jax.Array,
-        senders: jax.Array,
-        receivers: jax.Array,
-    ):
-        # input features are one-hot encoded species
+    def __call__(self, data: jraph.GraphsTuple):
+        # Build edge displacements with PBC offsets
+        positions = data.nodes["positions"]
+        r = positions[data.senders] - positions[data.receivers]
+
+        # Input node features: one-hot species
         features = e3nn.IrrepsArray(
-            e3nn.Irreps(f"{self.n_species}x0e"), jax.nn.one_hot(species, self.n_species)
+            e3nn.Irreps(f"{self.n_species}x0e"),
+            jax.nn.one_hot(data.nodes["species"], self.n_species),
         )
 
-        # safe norm (avoids nan for r = 0)
-        square_r_norm = jnp.sum(displacements**2, axis=-1)
+        # Radial basis with polynomial cutoff
+        square_r_norm = jnp.sum(r**2, axis=-1)
         r_norm = jnp.where(square_r_norm == 0.0, 0.0, jnp.sqrt(square_r_norm))
-
         radial_basis = (
             bessel_basis(r_norm, self.radial_basis_size, self.cutoff)
             * polynomial_cutoff(
@@ -303,91 +305,67 @@ class Nequix(eqx.Module):
             )[:, None]
         )
 
-        # compute spherical harmonics of edge displacements
+        # Spherical harmonics on edges
         sh = e3nn.spherical_harmonics(
             e3nn.s2_irreps(self.lmax),
-            displacements,
+            r,
             normalize=True,
             normalization="component",
         )
 
+        # Message passing
         for layer in self.layers:
             features = layer(
                 features,
-                species,
+                data.nodes["species"],
                 sh,
                 radial_basis,
-                senders,
-                receivers,
+                data.senders,
+                data.receivers,
             )
 
-        node_energies = self.readout(features)
-
-        # scale and shift energies
-        node_energies = node_energies * jax.lax.stop_gradient(self.scale) + jax.lax.stop_gradient(
-            self.shift
-        )
-
-        # add isolated atom energies to each node as prior
-        node_energies = node_energies + jax.lax.stop_gradient(self.atom_energies[species, None])
-
-        return node_energies.array
-
-    def __call__(self, data: jraph.GraphsTuple):
-        # compute forces and stress as gradient of total energy with respect to positions and strain
-        def total_energy_fn(positions_eps: tuple[jax.Array, jax.Array]):
-            positions, eps = positions_eps
-            eps_sym = (eps + eps.swapaxes(1, 2)) / 2
-            eps_sym_per_node = jnp.repeat(
-                eps_sym,
-                data.n_node,
-                axis=0,
-                total_repeat_length=data.nodes["positions"].shape[0],
-            )
-            # apply strain to positions and cell
-            positions = positions + jnp.einsum("ik,ikj->ij", positions, eps_sym_per_node)
-            cell = data.globals["cell"] + jnp.einsum("bij,bjk->bik", data.globals["cell"], eps_sym)
-            cell_per_edge = jnp.repeat(
-                cell,
-                data.n_edge,
-                axis=0,
-                total_repeat_length=data.edges["shifts"].shape[0],
-            )
-            offsets = jnp.einsum("ij,ijk->ik", data.edges["shifts"], cell_per_edge)
-            r = positions[data.senders] - positions[data.receivers] + offsets
-            node_energies = self.node_energies(
-                r, data.nodes["species"], data.senders, data.receivers
-            )
-            return jnp.sum(node_energies), node_energies
-
-        eps = jnp.zeros_like(data.globals["cell"])
-
-        (minus_forces, virial), node_energies = eqx.filter_grad(total_energy_fn, has_aux=True)(
-            (data.nodes["positions"], eps)
-        )
-
-        # padded nodes may have nan forces, so we mask them
+        p_node = self.readout_pvec(features)
         node_mask = jraph.get_node_padding_mask(data)
-
-        minus_forces = jnp.where(node_mask[:, None], minus_forces, 0.0)
-
-        # compute total energies across each subgraph
-        graph_energies = jraph.segment_sum(
-            node_energies,
+        node_mask = jnp.where(jnp.any(node_mask), node_mask, jnp.ones_like(node_mask, dtype=bool))
+        p_node_array = jnp.where(node_mask[:, None], p_node.array, 0.0)
+        p_graph = jraph.segment_sum(
+            p_node_array,
             node_graph_idx(data),
             num_segments=data.n_node.shape[0],
             indices_are_sorted=True,
         )
 
-        det = jnp.abs(jnp.linalg.det(data.globals["cell"]))[:, None, None]
-        det = jnp.where(det > 0.0, det, 1.0)  # padded graphs have det = 0
-        stress = virial / det
+        per_node_orb = self.species_orbital_dims[data.nodes["species"]]
+        per_node_orb = per_node_orb * node_mask.astype(per_node_orb.dtype)
+        D_graph = jraph.segment_sum(
+            per_node_orb,
+            node_graph_idx(data),
+            num_segments=data.n_node.shape[0],
+            indices_are_sorted=True,
+        )  # shape (B,)
 
-        # padded stress may be nan, so we mask them
+        M = jnp.max(D_graph)
+
+        i_idx = jnp.arange(M, dtype=jnp.int32)[None, :, None]
+        j_idx = jnp.arange(M, dtype=jnp.int32)[None, None, :]
+        D_b = D_graph[:, None, None]
+
+        valid_square = (i_idx < D_b) & (j_idx < D_b)
+        valid_upper = valid_square & (j_idx >= i_idx)
+
+        # compute compact upper-tri indices: i*D - i*(i-1)/2 + (j - i)
+        row_offsets = i_idx * D_b - (i_idx * (i_idx - 1)) // 2  # (B, M, 1)
+        idx_compact = row_offsets + (j_idx - i_idx)  # (B, M, M)
+
+        idx_safe = jnp.where(valid_upper, idx_compact, 0)
+        gathered = jnp.take_along_axis(p_graph[:, None, None, :], idx_safe[..., None], axis=-1)[
+            ..., 0
+        ]
+        P_upper = gathered * valid_upper.astype(p_graph.dtype)
+        eye_mask = jnp.eye(M, dtype=bool)[None, :, :]
+        P_full = P_upper + jnp.swapaxes(P_upper, 1, 2) - jnp.where(eye_mask, P_upper, 0)
         graph_mask = jraph.get_graph_padding_mask(data)
-        stress = jnp.where(graph_mask[:, None, None], stress, 0.0)
-
-        return graph_energies[:, 0], -minus_forces, stress
+        return P_full, valid_square, graph_mask
 
 
 def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
@@ -451,8 +429,7 @@ def load_model(path: str) -> tuple[Nequix, dict]:
             layer_norm=config["layer_norm"],
             shift=config["shift"],
             scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"],
-            # NOTE: atom_energies will be in model weights
+            avg_n_neighbors=config["avg_n_neighbors"]
         )
         model = eqx.tree_deserialise_leaves(f, model)
         return model, config
