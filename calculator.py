@@ -7,12 +7,12 @@ import urllib.request
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 
-from nequix.data import (
+from data import (
     atomic_numbers_to_indices,
     dict_to_graphstuple,
     preprocess_graph,
 )
-from nequix.model import load_model
+from model import load_model
 
 
 class NequixCalculator(Calculator):

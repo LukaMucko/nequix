@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import jraph
 
-from nequix.layer_norm import RMSLayerNorm
-from nequix.data import basis_irreps_e3nn
+from layer_norm import RMSLayerNorm
+from data import basis_irreps_e3nn
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:

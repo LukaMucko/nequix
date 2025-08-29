@@ -17,7 +17,7 @@ import yaml
 import wandb
 from wandb_osh.hooks import TriggerWandbSyncHook
 
-from nequix.data import (
+from data import (
     DataLoader,
     Dataset,
     ParallelLoader,
@@ -25,7 +25,7 @@ from nequix.data import (
     dataset_stats,
     prefetch,
 )
-from nequix.model import Nequix, save_model, weight_decay_mask
+from model import Nequix, save_model, weight_decay_mask
 
 
 @eqx.filter_jit
