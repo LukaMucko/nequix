@@ -47,7 +47,8 @@ def dict_to_graphstuple(graph_dict: dict) -> jraph.GraphsTuple:
         },
         edges={"shifts": graph_dict["shifts"]},
         senders=graph_dict["senders"],
-        receivers=graph_dict["receivers"]
+        receivers=graph_dict["receivers"],
+        globals=None,
     )
 
 
