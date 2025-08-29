@@ -22,9 +22,7 @@ def preprocess_graph(
     cutoff: float,
     targets: bool,
 ) -> dict:
-    src, dst, _ = matscipy.neighbours.neighbour_list(
-        "ijS", atoms, cutoff
-    )  # atoms need to have a cell (np.eye(3) is enough)
+    src, dst, shift = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff) #atoms need to have a cell
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
         "n_edge": np.array([len(src)]).astype(np.int32),
@@ -32,6 +30,7 @@ def preprocess_graph(
         "receivers": src.astype(np.int32),
         "species": np.array([atom_indices[n] for n in atoms.get_atomic_numbers()]).astype(np.int32),
         "positions": atoms.positions.astype(np.float32),
+        "shifts": shift.astype(np.float32),
     }
     return graph_dict
 
@@ -104,7 +103,7 @@ class Dataset:
         cutoff: float = 5.0,
         valid_frac: float = 0.1,
         seed: int = 42,
-        targets: bool = False,
+        targets: bool = False
     ):
         self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
         file_path = Path(file_path)
@@ -173,8 +172,7 @@ class Dataset:
         else:
             data = ase.io.read(file_path, index=":", format="extxyz")
             graphs = [
-                preprocess_graph(atoms, self.atomic_indices, cutoff, targets)
-                for atoms in tqdm(data)
+                preprocess_graph(atoms, self.atomic_indices, cutoff, targets) for atoms in tqdm(data)
             ]
             save_graphs_to_hdf5(graphs, cache_dir / "chunk_0000.h5")
 
@@ -417,23 +415,22 @@ def scf_density_matrix(atoms: ase.Atoms, basis: str = "sto-3g") -> np.ndarray:
 from pyscf import gto
 from collections import Counter
 
-
 def basis_irreps_e3nn(basis_name, atoms=["H", "C", "N", "O", "S"]):
     final_irreps_list = []
     for atom in atoms:
         basis_data = gto.basis.load(basis_name, atom)
-
+        
         angular_momenta = [shell_info[0] for shell_info in basis_data]
         l_counts = Counter(angular_momenta)
-
+        
         irrep_parts = []
         for l in sorted(l_counts.keys()):
             count = l_counts[l]
             parity = "e" if l % 2 == 0 else "o"
             irrep_type = f"{l}{parity}"
             irrep_parts.append(f"{count}x{irrep_type}")
-
+            
         full_irrep_string = " + ".join(irrep_parts)
         final_irreps_list.append(full_irrep_string)
-
+        
     return final_irreps_list
