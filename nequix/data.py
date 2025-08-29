@@ -13,6 +13,7 @@ import matscipy.neighbours
 import numpy as np
 import yaml
 from tqdm import tqdm
+from pyscf import gto, scf
 
 
 def preprocess_graph(
@@ -115,6 +116,7 @@ class Dataset:
         cutoff: float = 5.0,
         valid_frac: float = 0.1,
         seed: int = 42,
+        targets: bool = False
     ):
         self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
         file_path = Path(file_path)
@@ -125,7 +127,7 @@ class Dataset:
         self.hdf5_files = sorted(cache_dir.glob("chunk_*.h5"))
 
         if not self.hdf5_files:
-            self._create_cache(file_path, cache_dir, cutoff)
+            self._create_cache(file_path, cache_dir, cutoff, targets)
             self.hdf5_files = sorted(cache_dir.glob("chunk_*.h5"))
 
         self._file_handles = None
@@ -155,7 +157,7 @@ class Dataset:
         state["_file_handles"] = None
         return state
 
-    def _create_cache(self, file_path, cache_dir, cutoff):
+    def _create_cache(self, file_path, cache_dir, cutoff, targets):
         if file_path.is_dir():
             file_paths = sorted(file_path.glob("*.extxyz"))
             n_workers = 16
@@ -183,7 +185,7 @@ class Dataset:
         else:
             data = ase.io.read(file_path, index=":", format="extxyz")
             graphs = [
-                preprocess_graph(atoms, self.atomic_indices, cutoff, True) for atoms in tqdm(data)
+                preprocess_graph(atoms, self.atomic_indices, cutoff, targets) for atoms in tqdm(data)
             ]
             save_graphs_to_hdf5(graphs, cache_dir / "chunk_0000.h5")
 
@@ -433,3 +435,16 @@ def dataset_stats(dataset: Dataset, atom_energies: list[float]) -> dict:
     print(yaml.dump(stats))
     return stats
 
+
+def scf_density_matrix(atoms: ase.Atoms, basis: str = "sto-3g") -> np.ndarray:
+    mol = gto.M(
+        atom=[(s, tuple(p)) for s, p in zip(atoms.get_chemical_symbols(), atoms.positions)],
+        basis=basis,
+        charge=0,
+        spin=0,
+        unit="Angstrom",
+    )
+    mf = scf.RHF(mol)
+    mf.kernel()
+    c = mf.mo_coeff
+    return c @ np.diag(mf.mo_occ) @ c.T
