@@ -411,3 +411,27 @@ def scf_density_matrix(atoms: ase.Atoms, basis: str = "sto-3g") -> np.ndarray:
     mf.kernel()
     c = mf.mo_coeff
     return c @ np.diag(mf.mo_occ) @ c.T
+
+
+from pyscf import gto
+from collections import Counter
+
+def basis_irreps_e3nn(basis_name, atoms=["H", "C", "N", "O", "S"]):
+    final_irreps_list = []
+    for atom in atoms:
+        basis_data = gto.basis.load(basis_name, atom)
+        
+        angular_momenta = [shell_info[0] for shell_info in basis_data]
+        l_counts = Counter(angular_momenta)
+        
+        irrep_parts = []
+        for l in sorted(l_counts.keys()):
+            count = l_counts[l]
+            parity = "e" if l % 2 == 0 else "o"
+            irrep_type = f"{l}{parity}"
+            irrep_parts.append(f"{count}x{irrep_type}")
+            
+        full_irrep_string = " + ".join(irrep_parts)
+        final_irreps_list.append(full_irrep_string)
+        
+    return final_irreps_list
