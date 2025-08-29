@@ -237,7 +237,7 @@ class Nequix(eqx.Module):
         avg_n_neighbors: float = 1.0,
         layer_norm: bool = False,
         basis: str = "sto-3g",
-        max_orbitals: int = 51, #C7H16 for sto-3g
+        max_orbitals: int = 51,  # C7H16 for sto-3g
     ):
         self.lmax = lmax
         self.cutoff = cutoff
@@ -429,7 +429,7 @@ def load_model(path: str) -> tuple[Nequix, dict]:
             layer_norm=config["layer_norm"],
             shift=config["shift"],
             scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"]
+            avg_n_neighbors=config["avg_n_neighbors"],
         )
         model = eqx.tree_deserialise_leaves(f, model)
         return model, config
