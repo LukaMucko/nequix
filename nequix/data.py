@@ -33,14 +33,6 @@ def preprocess_graph(
         "shifts": shift.astype(np.float32),
         "cell": atoms.cell.astype(np.float32),
     }
-    if targets:
-        graph_dict["forces"] = atoms.get_forces().astype(np.float32)
-        graph_dict["energy"] = np.array([atoms.get_potential_energy()]).astype(np.float32)
-        try:
-            graph_dict["stress"] = atoms.get_stress(voigt=False).astype(np.float32)
-        except ase.calculators.calculator.PropertyNotImplementedError:
-            pass
-
     return graph_dict
 
 
@@ -55,12 +47,7 @@ def dict_to_graphstuple(graph_dict: dict) -> jraph.GraphsTuple:
         },
         edges={"shifts": graph_dict["shifts"]},
         senders=graph_dict["senders"],
-        receivers=graph_dict["receivers"],
-        globals={
-            "cell": graph_dict["cell"][None, ...],
-            "energy": graph_dict["energy"] if "energy" in graph_dict else None,
-            "stress": graph_dict["stress"][None, ...] if "stress" in graph_dict else None,
-        },
+        receivers=graph_dict["receivers"]
     )
 
 
@@ -391,40 +378,15 @@ def prefetch(loader, queue_size=4):
 #     return pad_graph_to_nearest_power_of_two(jraph.batch_np(graphs))
 
 
-# based on https://github.com/ACEsuit/mace/blob/d39cc6b/mace/data/utils.py#L300
-def average_atom_energies(dataset: Dataset) -> list[float]:
-    """Compute the average energy of each species in the dataset."""
-    atomic_indices = dataset.atomic_indices
-    A = np.zeros((len(dataset), len(atomic_indices)), dtype=np.float32)
-    B = np.zeros((len(dataset),), dtype=np.float32)
-    for i, graph in tqdm(enumerate(dataset), total=len(dataset)):
-        A[i] = np.bincount(graph.nodes["species"], minlength=len(atomic_indices))
-        B[i] = graph.globals["energy"][0]
-    E0s = np.linalg.lstsq(A, B, rcond=None)[0].tolist()
-    idx_to_atomic_number = {v: k for k, v in atomic_indices.items()}
-    atom_energies = {idx_to_atomic_number[i]: e0 for i, e0 in enumerate(E0s)}
-    print("computed energies, add to config yml file to avoid recomputing:")
-    print(yaml.dump({"atom_energies": atom_energies}))
-    return E0s
-
-
-def dataset_stats(dataset: Dataset, atom_energies: list[float]) -> dict:
+def dataset_stats(dataset: Dataset) -> dict:
     """Compute the statistics of the dataset."""
-    energies, forces, n_neighbors, n_nodes, n_edges = [], [], [], [], []
-    atom_energies = np.array(atom_energies)
+    n_neighbors, n_nodes, n_edges = [], [], []
     for graph in tqdm(dataset, total=len(dataset)):
-        graph_e0 = np.sum(atom_energies[graph.nodes["species"]])
-        energies.append((graph.globals["energy"][0] - graph_e0) / graph.n_node)
-        forces.append(graph.nodes["forces"])
         n_neighbors.append(graph.n_edge / graph.n_node)
         n_nodes.append(graph.n_node)
         n_edges.append(graph.n_edge)
-    mean = np.mean(np.concatenate(energies, axis=0))
-    rms = np.sqrt(np.mean(np.concatenate(forces, axis=0) ** 2))
     n_neighbors = np.mean(np.concatenate(n_neighbors, axis=0))
     stats = {
-        "shift": mean.item(),
-        "scale": rms.item(),
         "avg_n_neighbors": n_neighbors.item(),
         "avg_n_nodes": np.mean(n_nodes).item(),
         "avg_n_edges": np.mean(n_edges).item(),
