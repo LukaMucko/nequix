@@ -24,6 +24,9 @@ dependencies = [
     "h5py>=3.14.0",
     "wandb-osh>=1.2.2",
     "cloudpickle>=3.1.1",
+    "load-atoms>=0.3.9",
+    "jupyter>=1.1.1",
+    "pyscf>=2.10.0",
 ]
 
 [project.urls]
