@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import jraph
 
 from nequix.layer_norm import RMSLayerNorm
-from data import basis_irreps_e3nn
+from nequix.data import basis_irreps_e3nn
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
@@ -212,13 +212,12 @@ class Nequix(eqx.Module):
     radial_basis_size: int = eqx.field(static=True)
     radial_polynomial_p: float = eqx.field(static=True)
     cutoff: float = eqx.field(static=True)
-    shift: float = eqx.field(static=True)
-    scale: float = eqx.field(static=True)
 
     layers: list[NequixConvolution]
     readout_pvec: e3nn.equinox.Linear
     species_orbital_irreps: list[e3nn.Irreps] = eqx.field(static=True)
     species_orbital_dims: jax.Array
+    max_orbitals: int = eqx.field(static=True)
     max_p_len: int = eqx.field(static=True)
 
     def __init__(
@@ -238,6 +237,7 @@ class Nequix(eqx.Module):
         avg_n_neighbors: float = 1.0,
         layer_norm: bool = False,
         basis: str = "sto-3g",
+        max_orbitals: int = 51, #C7H16 for sto-3g
     ):
         self.lmax = lmax
         self.cutoff = cutoff
@@ -249,7 +249,7 @@ class Nequix(eqx.Module):
         self.species_orbital_dims = jnp.array(
             [irr.dim for irr in self.species_orbital_irreps], dtype=jnp.int32
         )
-
+        self.max_orbitals = max_orbitals
         self.max_p_len = (self.max_orbitals * (self.max_orbitals + 1)) // 2
         input_irreps = e3nn.Irreps(f"{n_species}x0e")
         sh_irreps = e3nn.s2_irreps(lmax)
