@@ -5,7 +5,6 @@ from pathlib import Path
 
 import ase
 import ase.io
-import ase.neighborlist
 import h5py
 import jax
 import jraph
@@ -20,9 +19,9 @@ def preprocess_graph(
     atoms: ase.Atoms,
     atom_indices: dict[int, int],
     cutoff: float,
-    targets: bool,
 ) -> dict:
-    src, dst, shift = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff) #atoms need to have a cell
+    atoms.set_cell(np.eye(3))
+    src, dst, shift = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff)
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
         "n_edge": np.array([len(src)]).astype(np.int32),
@@ -32,22 +31,23 @@ def preprocess_graph(
         "positions": atoms.positions.astype(np.float32),
         "shifts": shift.astype(np.float32),
     }
+    if 'density_matrix' in atoms.info:
+        graph_dict["density"] = atoms.info['density_matrix'].astype(np.float32)
     return graph_dict
 
 
-def dict_to_graphstuple(graph_dict: dict) -> jraph.GraphsTuple:
+def dict_to_graphstuple(graph_dict: dict, P_t: np.ndarray | None = None) -> jraph.GraphsTuple:
     return jraph.GraphsTuple(
         n_node=graph_dict["n_node"],
         n_edge=graph_dict["n_edge"],
         nodes={
             "species": graph_dict["species"],
             "positions": graph_dict["positions"],
-            "forces": graph_dict["forces"] if "forces" in graph_dict else None,
         },
         edges={"shifts": graph_dict["shifts"]},
         senders=graph_dict["senders"],
         receivers=graph_dict["receivers"],
-        globals=None,
+        globals=P_t.astype(np.float32) if P_t is not None else None,
     )
 
 
@@ -60,7 +60,7 @@ def preprocess_file(
     file_path: str, atomic_indices: dict[int, int], cutoff: float
 ) -> list[dict]:  # Now returns list of dicts
     data = ase.io.read(file_path, index=":", format="extxyz")
-    return [preprocess_graph(atoms, atomic_indices, cutoff, True) for atoms in data]
+    return [preprocess_graph(atoms, atomic_indices, cutoff) for atoms in data]
 
 
 def save_graphs_to_hdf5(graphs, output_path, progress_bar=True):
@@ -85,7 +85,7 @@ def process_worker_files(args):
         disable=worker_id != 0,
     ):
         data = ase.io.read(file_path, index=":", format="extxyz")
-        graphs = [preprocess_graph(atoms, atomic_indices, cutoff, True) for atoms in data]
+        graphs = [preprocess_graph(atoms, atomic_indices, cutoff) for atoms in data]
         all_graphs.extend(graphs)
 
     save_graphs_to_hdf5(all_graphs, output_path, progress_bar=worker_id == 0)
@@ -172,7 +172,7 @@ class Dataset:
         else:
             data = ase.io.read(file_path, index=":", format="extxyz")
             graphs = [
-                preprocess_graph(atoms, self.atomic_indices, cutoff, targets) for atoms in tqdm(data)
+                preprocess_graph(atoms, self.atomic_indices, cutoff) for atoms in tqdm(data)
             ]
             save_graphs_to_hdf5(graphs, cache_dir / "chunk_0000.h5")
 
@@ -307,12 +307,44 @@ class DataLoader:
         self.idx = 0
         if self.shuffle:
             self.idxs = self.rng.permutation(np.arange(len(self.dataset)))
-        self._generator = jraph.dynamically_batch(
-            self.make_generator(),
-            n_node=self.n_node,
-            n_edge=self.n_edge,
-            n_graph=self.n_graph,
-        )
+        it = self.make_generator()
+
+        def flush_batch(batch):
+            if not batch:
+                return None
+            padded = _pad_globals_for_batch(batch)
+            batched = jraph.batch_np(padded)
+            return jraph.pad_with_graphs(batched, self.n_node, self.n_edge, self.n_graph)
+
+        def gen():
+            batch, nodes, edges, graphs = [], 0, 0, 0
+            while True:
+                try:
+                    g = next(it)
+                except StopIteration:
+                    if batch:
+                        out = flush_batch(batch)
+                        if out is not None:
+                            yield out
+                    return
+                elem_nodes = int(g.n_node[0])
+                elem_edges = int(g.n_edge[0])
+                would_overflow = (
+                    (graphs + 1 > self.n_graph - 1) or
+                    (nodes + elem_nodes > self.n_node - 1) or
+                    (edges + elem_edges > self.n_edge)
+                )
+                if batch and would_overflow:
+                    out = flush_batch(batch)
+                    if out is not None:
+                        yield out
+                    batch, nodes, edges, graphs = [], 0, 0, 0
+                batch.append(g)
+                nodes += elem_nodes
+                edges += elem_edges
+                graphs += 1
+
+        self._generator = gen()
         return self
 
     def __next__(self):
@@ -434,3 +466,41 @@ def basis_irreps_e3nn(basis_name, atoms=["H", "C", "N", "O", "S"]):
         final_irreps_list.append(full_irrep_string)
         
     return final_irreps_list
+
+import numpy as np
+import jraph
+
+def _pad_globals_for_batch(graphs):
+    # Find maximum matrix size in batch
+    D = 0
+    for g in graphs:
+        gl = g.globals
+        if gl is None:
+            continue
+        a = np.asarray(gl)
+        if a.ndim == 3:
+            d = a.shape[-1]
+        elif a.ndim == 2:
+            d = a.shape[-1]
+        else:
+            continue
+        D = max(D, d)
+
+    padded = []
+    for g in graphs:
+        gl = g.globals
+        dtype = np.float32 if gl is None else np.asarray(gl).dtype
+        if D == 0:
+            new_gl = np.zeros((1, 0, 0), dtype=dtype)
+        else:
+            new_gl = np.zeros((1, D, D), dtype=dtype)
+            if gl is not None:
+                a = np.asarray(gl)
+                if a.ndim == 3:
+                    a = a[0]
+                d = a.shape[-1]
+                new_gl[0, :d, :d] = a
+        padded.append(jraph.GraphsTuple(
+            n_node=g.n_node, n_edge=g.n_edge, nodes=g.nodes, edges=g.edges,
+            senders=g.senders, receivers=g.receivers, globals=new_gl))
+    return padded
