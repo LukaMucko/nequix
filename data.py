@@ -30,9 +30,8 @@ def preprocess_graph(
         "species": np.array([atom_indices[n] for n in atoms.get_atomic_numbers()]).astype(np.int32),
         "positions": atoms.positions.astype(np.float32),
         "shifts": shift.astype(np.float32),
+        "density": atoms.info['density_matrix'].astype(np.float32)
     }
-    if 'density_matrix' in atoms.info:
-        graph_dict["density"] = atoms.info['density_matrix'].astype(np.float32)
     return graph_dict
 
 
@@ -179,13 +178,19 @@ class Dataset:
     def __len__(self) -> int:
         return len(self.index_map)
 
-    def __getitem__(self, idx: int) -> jraph.GraphsTuple:
+    def __getitem__(self, idx: int) -> tuple[jraph.GraphsTuple, np.ndarray | None]:
         file_idx, local_idx = self.index_map[idx]
         grp = self.file_handles[file_idx][f"graph_{local_idx}"]
         graph_dict = {}
         for key in grp:
             graph_dict[key] = grp[key][:]
-        return dict_to_graphstuple(graph_dict)
+        # Ground-truth density matrix (per-molecule)
+        P_gt = graph_dict.get("density", None)
+        if P_gt is None:
+            # backward compatibility with older caches
+            P_gt = graph_dict.get("density_matrix", None)
+        g = dict_to_graphstuple(graph_dict)
+        return g, (P_gt.astype(np.float32) if P_gt is not None else None)
 
     def __del__(self):
         if hasattr(self, "_file_handles"):
@@ -312,21 +317,59 @@ class DataLoader:
         def flush_batch(batch):
             if not batch:
                 return None
-            padded = _pad_globals_for_batch(batch)
-            batched = jraph.batch_np(padded)
-            return jraph.pad_with_graphs(batched, self.n_node, self.n_edge, self.n_graph)
+            # Attach per-graph globals = ground-truth P (un-padded) and collect targets
+            graphs_with_P = []
+            P_list = []
+            for item in batch:
+                if isinstance(item, tuple):
+                    g, P = item
+                else:
+                    g, P = item, None
+                P_list.append(P)
+                gl = P.astype(np.float32) if P is not None else None
+                graphs_with_P.append(jraph.GraphsTuple(
+                    n_node=g.n_node, n_edge=g.n_edge, nodes=g.nodes, edges=g.edges,
+                    senders=g.senders, receivers=g.receivers, globals=gl))
+
+            # Pad globals to the largest P in the batch, then batch and pad graphs
+            padded_graphs = _pad_globals_for_batch(graphs_with_P)
+            batched = jraph.batch_np(padded_graphs)
+            batched = jraph.pad_with_graphs(batched, self.n_node, self.n_edge, self.n_graph)
+
+            # Build padded P targets and mask aligned to n_graph
+            D = 0
+            for P in P_list:
+                if P is not None:
+                    D = max(D, int(P.shape[-1]))
+
+            G = self.n_graph
+            if D == 0:
+                P_targets = np.zeros((G, 0, 0), dtype=np.float32)
+                P_mask = np.zeros((G, 0, 0), dtype=bool)
+            else:
+                P_targets = np.zeros((G, D, D), dtype=np.float32)
+                P_mask = np.zeros((G, D, D), dtype=bool)
+                for i, P in enumerate(P_list):
+                    if P is None:
+                        continue
+                    d = int(P.shape[-1])
+                    P_targets[i, :d, :d] = P
+                    P_mask[i, :d, :d] = True
+
+            return batched, P_targets, P_mask
 
         def gen():
             batch, nodes, edges, graphs = [], 0, 0, 0
             while True:
                 try:
-                    g = next(it)
+                    item = next(it)
                 except StopIteration:
                     if batch:
                         out = flush_batch(batch)
                         if out is not None:
                             yield out
                     return
+                g = item[0] if isinstance(item, tuple) else item
                 elem_nodes = int(g.n_node[0])
                 elem_edges = int(g.n_edge[0])
                 would_overflow = (
@@ -339,7 +382,7 @@ class DataLoader:
                     if out is not None:
                         yield out
                     batch, nodes, edges, graphs = [], 0, 0, 0
-                batch.append(g)
+                batch.append(item)
                 nodes += elem_nodes
                 edges += elem_edges
                 graphs += 1
