@@ -364,8 +364,7 @@ class Nequix(eqx.Module):
         P_upper = gathered * valid_upper.astype(p_graph.dtype)
         eye_mask = jnp.eye(M, dtype=bool)[None, :, :]
         P_full = P_upper + jnp.swapaxes(P_upper, 1, 2) - jnp.where(eye_mask, P_upper, 0)
-        graph_mask = jraph.get_graph_padding_mask(data)
-        return P_full, valid_square, graph_mask
+        return P_full
 
 
 def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
